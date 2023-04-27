@@ -172,11 +172,13 @@ def process_tweet(json_response):
 
     json_response["sentiment_result"] = sentiment_result
 
-    matched_rule_tag = json_response["matching_rules"][0]["tag"]
-    if matched_rule_tag == "mitsotakis":
-        json_response["tag"] = "Μητσοτάκης"
-    elif matched_rule_tag == "tsipras":
-        json_response["tag"] = "Τσίπρας"
+    # Check if the "matching_rules" key exists in the json_response
+    if "matching_rules" in json_response and json_response["matching_rules"]:
+        matched_rule_tag = json_response["matching_rules"][0]["tag"]
+        if matched_rule_tag == "mitsotakis":
+            json_response["tag"] = "Μητσοτάκης"
+        elif matched_rule_tag == "tsipras":
+            json_response["tag"] = "Τσίπρας"
 
     hashtags = []
     if "entities" in tweet_data and "hashtags" in tweet_data["entities"]:
