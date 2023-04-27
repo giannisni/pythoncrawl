@@ -6,9 +6,27 @@ from datetime import datetime
 from elasticsearch import Elasticsearch
 from transformers import pipeline
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+import glob
+import time
+import threading
 
 sentiment_pipeline = pipeline("sentiment-analysis")
+
+def save_tweets_locally(tweets, folder="buffered_tweets"):
+    os.makedirs(folder, exist_ok=True)
+    timestamp = int(time.time())
+    filename = os.path.join(folder, f"tweets_{timestamp}.json")
+    with open(filename, "w") as f:
+        json.dump(tweets, f)
+
+def load_tweets_from_local(folder="buffered_tweets"):
+    tweet_files = glob.glob(os.path.join(folder, "*.json"))
+    tweets = []
+    for tweet_file in tweet_files:
+        with open(tweet_file, "r") as f:
+            tweets.extend(json.load(f))
+        os.remove(tweet_file)
+    return tweets
 
 def bulk_index_tweets_in_elasticsearch(tweets):
     actions = [
@@ -19,7 +37,6 @@ def bulk_index_tweets_in_elasticsearch(tweets):
         for tweet in tweets
     ]
     helpers.bulk(es, actions)
-
 
 def analyze_sentiment(text):
     result = sentiment_pipeline(text)[0]
@@ -44,7 +61,7 @@ def get_rules():
         raise Exception(
             "Cannot get rules (HTTP {}): {}".format(response.status_code, response.text)
         )
-    # print(json.dumps(response.json()))
+    print(json.dumps(response.json()))
     return response.json()
 
 def delete_all_rules(rules):
@@ -64,13 +81,13 @@ def delete_all_rules(rules):
                 response.status_code, response.text
             )
         )
-    # print(json.dumps(response.json()))
+    print(json.dumps(response.json()))
 
 def set_rules(delete):
     mitsotakis_and_tsipras_rules = [
-            {"value": "mitsotakis OR μητσοτακης OR μητσοτάκης OR Μητσοτάκης OR Μητσοτάκης OR Κούλης OR Mitsotakis OR #Mitsotakis OR #mitsotakis OR #Μητσοτάκης", "tag": "mitsotakis"},
-            {"value": "tsipras OR τσιπρας OR τσίπρας OR Τσίπρας OR Τσίπρας OR Αλέξης OR Tsipras OR #tsipras OR #Τσίπρας", "tag": "tsipras"}
-        ]
+        {"value": "mitsotakis OR μητσοτακης OR μητσοτάκης OR Μητσοτάκης OR Μητσοτάκης OR Κούλης OR Mitsotakis OR #Mitsotakis OR #mitsotakis OR #Μητσοτάκης", "tag": "mitsotakis"},
+        {"value": "tsipras OR τσιπρας OR τσίπρας OR Τσίπρας OR Τσίπρας OR Αλέξης OR Tsipras OR #tsipras OR #Τσίπρας", "tag": "tsipras"}
+    ]
     payload = {"add": mitsotakis_and_tsipras_rules}
     response = requests.post(
         "https://api.twitter.com/2/tweets/search/stream/rules",
@@ -81,11 +98,63 @@ def set_rules(delete):
         raise Exception(
             "Cannot add rules (HTTP {}): {}".format(response.status_code, response.text)
         )
-    # print(json.dumps(response.json()))
+    print(json.dumps(response.json()))
 
+def is_elasticsearch_up():
+    try:
+        return es.ping()
+    except Exception as e:
+        print(f"Error checking Elasticsearch status: {e}")
+        return False
+
+
+def index_local_tweets_periodically():
+    while True:
+        if is_elasticsearch_up():
+            # Index local tweets saved in JSON files
+            local_tweets = load_tweets_from_local()
+            if local_tweets:
+                bulk_index_tweets_in_elasticsearch(local_tweets)
+
+            # Sleep for a certain interval before checking again
+            time.sleep(60)
+        else:
+            # If Elasticsearch is down, wait for some time before checking its status again
+            time.sleep(60)
 def index_tweet_in_elasticsearch(tweet):
-    res = es.index(index="twitter", document=tweet)
-    print(f"Indexed tweet in Elasticsearch: {res['result']}")
+    max_retries = 1
+    retries = 0
+    indexed = False
+
+    while not indexed and retries < max_retries:
+        try:
+            res = es.index(index="twitter", document=tweet)
+            print(f"Indexed tweet in Elasticsearch: {res['result']}")
+            indexed = True
+        except Exception as e:
+            print(f"Error indexing tweet in Elasticsearch: {e}")
+            retries += 1
+            time.sleep(2 * retries)
+    return indexed
+
+# def index_local_tweets_periodically():
+#     while True:
+#         if is_elasticsearch_up():
+#             # Index local tweets saved in JSON files
+#             local_tweets = load_tweets_from_local()
+#             if local_tweets:
+#                 bulk_index_tweets_in_elasticsearch(local_tweets)
+#
+#             # Sleep for a certain interval before checking again
+#             time.sleep(60)
+#         else:
+#             # If Elasticsearch is down, wait for some time before checking its status again
+#             time.sleep(60)
+
+# Start a separate thread to handle indexing of local tweets periodically
+index_local_thread = threading.Thread(target=index_local_tweets_periodically)
+index_local_thread.start()
+
 
 def process_tweet(json_response):
     tweet_data = json_response.get("data", {})
@@ -99,7 +168,7 @@ def process_tweet(json_response):
             tweet_text = original_tweet.get("text", "")
 
     sentiment_result = analyze_sentiment(tweet_text)
-    # print(f"Sentiment result: {sentiment_result}")
+    print(f"Sentiment result: {sentiment_result}")
 
     json_response["sentiment_result"] = sentiment_result
 
@@ -121,49 +190,28 @@ def process_tweet(json_response):
     formatted_created_at = created_at_datetime.strftime("%Y-%m-%dT%H:%M:%S")
     tweet_data["created_at"] = formatted_created_at
 
-    # Update the text field of the tweet with the full text from the includes
-    if tweet_text.startswith("RT @"):
-        tweet_data["text"] = tweet_text
-    elif "includes" in json_response and "tweets" in json_response["includes"] and len(json_response["includes"]["tweets"]) > 0:
-        tweet_data["text"] = json_response["includes"]["tweets"][0]["text"]
-    else:
-        tweet_data["text"] = tweet_text
-
-    # Check if the tweet is a reply, retweet or tweet
-    if "referenced_tweets" in tweet_data:
-        ref_tweet_type = tweet_data["referenced_tweets"][0]["type"]
-        if ref_tweet_type == "retweeted":
-            tweet_type = "retweet"
-        elif ref_tweet_type == "replied_to":
-            tweet_type = "reply"
-        else:
-            tweet_type = "tweet"
-    elif "in_reply_to_user_id" in tweet_data:
-        tweet_type = "reply"
-    else:
-        tweet_type = "tweet"
-    tweet_data["tweet_type"] = tweet_type
-
     return json_response
 
+def get_stream():
+    def index_buffered_tweets(processed_tweets):
+        if is_elasticsearch_up():
+            bulk_index_tweets_in_elasticsearch(processed_tweets)
+        else:
+            save_tweets_locally(processed_tweets)
 
-
-
-def get_stream(set):
     response = requests.get(
         "https://api.twitter.com/2/tweets/search/stream",
         auth=bearer_oauth,
         stream=True,
         params={"tweet.fields": "created_at,entities,in_reply_to_user_id", "expansions": "referenced_tweets.id"},
     )
-    # print(response.status_code)
+    print(response.status_code)
     if response.status_code != 200:
         raise Exception(
             "Cannot get stream (HTTP {}): {}".format(
                 response.status_code, response.text
             )
         )
-
     tweet_buffer = []
     buffer_size = 100
 
@@ -171,26 +219,31 @@ def get_stream(set):
         for response_line in response.iter_lines():
             if response_line:
                 json_response = json.loads(response_line)
-                # print(json.dumps(json_response, indent=4, sort_keys=True))
+                print(json.dumps(json_response, indent=4, sort_keys=True))
 
-                # Process and index reply tweets immediately
-                if json_response.get("data", {}).get("in_reply_to_user_id"):
-                    processed_tweet = process_tweet(json_response)
-                    index_tweet_in_elasticsearch(processed_tweet)
-                else:
-                    tweet_buffer.append(json_response)
+                processed_tweet = process_tweet(json_response)
+
+                tweet_buffer.append(processed_tweet)
 
                 if len(tweet_buffer) >= buffer_size:
-                    processed_tweets = list(executor.map(process_tweet, tweet_buffer))
-                    bulk_index_tweets_in_elasticsearch(processed_tweets)
+                    index_buffered_tweets_thread = threading.Thread(target=index_buffered_tweets, args=(tweet_buffer,))
+                    index_buffered_tweets_thread.start()
+                    index_buffered_tweets_thread.join()
+
                     tweet_buffer = []
+
 
 
 def main():
     rules = get_rules()
     delete = delete_all_rules(rules)
-    set = set_rules(delete)
-    get_stream(set)
+    set_rules(delete)
+    get_stream()
 
 if __name__ == "__main__":
     main()
+
+    index_local_thread = threading.Thread(target=index_local_tweets_periodically)
+    index_local_thread.start()
+
+
