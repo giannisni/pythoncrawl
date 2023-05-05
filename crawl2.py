@@ -126,6 +126,8 @@ def index_tweet_in_elasticsearch(tweet):
     retries = 0
     indexed = False
 
+
+
     while not indexed and retries < max_retries:
         try:
             res = es.index(index="twitter", document=tweet)
