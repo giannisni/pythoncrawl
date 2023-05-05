@@ -8,4 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+VOLUME /app/tweet_storage
+
 CMD [ "python", "./crawl2.py" ]
