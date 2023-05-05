@@ -43,7 +43,7 @@ def analyze_sentiment(text):
     return result
 
 bearer_token = "AAAAAAAAAAAAAAAAAAAAABu2QgEAAAAAW2YRXJEvoxQQm4df3%2Fus93KvwBg%3DiO6aRlc50ZJu6vsr1aQAGigHL6UvqfeWccjEN1paQBHqp0T69n"
-es_host = "192.168.178.38"
+es_host = "localhost"
 es_port = "9200"
 
 es = Elasticsearch([{"host": es_host, "port": 9200, "scheme": "http"}])
